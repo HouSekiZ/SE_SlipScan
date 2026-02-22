@@ -1,3 +1,18 @@
+"""
+SlipScan OCR Service
+====================
+Dependencies:
+    pip install typhoon-ocr pillow opencv-python-headless
+
+Setup:
+    export TYPHOON_OCR_API_KEY=your_api_key_here
+    # รับ API key ได้ที่ https://opentyphoon.ai
+
+Usage:
+    ocr = SlipOCR()
+    raw_text = ocr.read("slip.jpg")
+"""
+
 import logging
 from pathlib import Path
 
@@ -54,9 +69,6 @@ class ImagePreprocessor:
             scale = 1200 / max(h, w)
             gray = cv2.resize(gray, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
 
-        # Deskew
-        gray = ImagePreprocessor._deskew(gray)
-
         # Adaptive Threshold
         thresh = cv2.adaptiveThreshold(
             gray, 255,
@@ -72,25 +84,6 @@ class ImagePreprocessor:
         out_path = image_path.replace(".", "_processed.")
         cv2.imwrite(out_path, sharp)
         return out_path
-
-    @staticmethod
-    def _deskew(gray: "np.ndarray") -> "np.ndarray":
-        try:
-            edges = cv2.Canny(gray, 50, 150, apertureSize=3)
-            lines = cv2.HoughLines(edges, 1, np.pi / 180, threshold=100)
-            if lines is None:
-                return gray
-            angles = [line[0][1] for line in lines]
-            skew_deg = (np.median(angles) - np.pi / 2) * (180 / np.pi)
-            if abs(skew_deg) > 0.5:
-                h, w = gray.shape
-                M = cv2.getRotationMatrix2D((w / 2, h / 2), skew_deg, 1)
-                gray = cv2.warpAffine(gray, M, (w, h),
-                                      flags=cv2.INTER_CUBIC,
-                                      borderMode=cv2.BORDER_REPLICATE)
-        except Exception:
-            pass
-        return gray
 
     @staticmethod
     def _pil_preprocess(image_path: str) -> str:
