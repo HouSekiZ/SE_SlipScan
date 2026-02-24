@@ -94,6 +94,7 @@ class ImagePreprocessor:
 
 class TyphoonOCREngine:
 
+
     def __init__(self, base_url: str | None = None, api_key: str | None = None):
         if not TYPHOON_AVAILABLE:
             raise ImportError("pip install typhoon-ocr")
@@ -118,6 +119,7 @@ class TyphoonOCREngine:
 
 class SlipParser:
 
+
     # ธนาคารไทย
     BANK_PATTERNS = {
         'กสิกรไทย':     r'(?:kbank|กสิกร|kasikorn)',
@@ -134,93 +136,134 @@ class SlipParser:
 
     # Regex patterns
     AMOUNT_REGEX = re.compile(
-        r'(?:จำนวน|amount|total|ยอดโอน|฿|thb)?\s*([\d,]+\.?\d{0,2})',
+        r'(?:จำนวน|amount|total|ยอดโอน)[:\s]*([\d,]+\.?\d{0,2})\s*(?:บาท|baht|thb)?',
         re.IGNORECASE
     )
     
     DATE_REGEX = re.compile(
-        r'(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})'
+        r'(\d{1,2})\s*(?:ก\.พ\.|ม\.ค\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)\s*(\d{2,4})|(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})'
     )
     
     TIME_REGEX = re.compile(
-        r'(\d{1,2}):(\d{2})(?::(\d{2}))?'
+        r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(?:น\.|AM|PM)?'
     )
     
     REF_REGEX = re.compile(
-        r'(?:ref|อ้างอิง|หมายเลข|reference)[.\s:]*([A-Z0-9]{6,20})',
+        r'(?:เลขที่รายการ|ref|อ้างอิง|หมายเลข|reference)[.\s:]*([A-Z0-9]{10,30})',
         re.IGNORECASE
     )
     
-    ACCOUNT_REGEX = re.compile(
-        r'(\d{3}[\-]?\d{1}[\-]?\d{4,5}[\-]?\d{1})'
+    # บัญชีธนาคารทั่วไป (xxx-x-xxxxx-x)
+    BANK_ACCOUNT_REGEX = re.compile(
+        r'(xxx[\-]?x[\-]?x\d{4}[\-]?x|\d{3}[\-]?\d{1}[\-]?\d{4,5}[\-]?\d{1})'
+    )
+    
+    # รหัสผู้รับ/Merchant ID (ตัวเลขยาว 10-20 หลัก)
+    MERCHANT_ID_REGEX = re.compile(
+        r'(?<!เลขที่รายการ:\s)(?<!ref\s)(\d{12,20})(?!\s*บาท)',
+        re.IGNORECASE
     )
 
     def parse(self, raw_text: str) -> dict[str, Any]:
-        """
-        แยกข้อมูลจาก raw OCR text
 
-        Returns:
-            {
-                "sender_name": str,
-                "bank_name": str,
-                "amount": float,
-                "slip_date": str,  # YYYY-MM-DD
-                "slip_time": str,  # HH:MM:SS
-                "ref_no": str,
-                "receiver_name": str,
-                "receiver_account": str,
-                "raw_ocr": str
-            }
-        """
         text = raw_text.lower()
 
         return {
             "sender_name": self._extract_sender_name(raw_text),
+            "sender_account": self._extract_sender_account(raw_text),
             "bank_name": self._extract_bank_name(text),
             "amount": self._extract_amount(text),
             "slip_date": self._extract_date(text),
             "slip_time": self._extract_time(text),
             "ref_no": self._extract_ref_no(raw_text),
             "receiver_name": self._extract_receiver_name(raw_text),
-            "receiver_account": self._extract_account(raw_text),
+            "receiver_account": self._extract_receiver_account(raw_text),
             "raw_ocr": raw_text,
         }
 
     def _extract_amount(self, text: str) -> float | None:
-        """ดึงจำนวนเงิน"""
-        matches = self.AMOUNT_REGEX.findall(text)
+        # ลองหา pattern ที่ชัดเจนก่อน
+        match = self.AMOUNT_REGEX.search(text)
+        if match:
+            amount_str = match.group(1).replace(',', '')
+            try:
+                return float(amount_str)
+            except ValueError:
+                pass
+        
+        # Fallback: หาตัวเลขที่มี .00 และไม่ใช่เลขยาวเกินไป
+        fallback_pattern = re.compile(r'(\d{1,6}\.?\d{0,2})\s*(?:บาท|baht)')
+        matches = fallback_pattern.findall(text)
         if matches:
-            # เลือกจำนวนที่สูงสุด (มักเป็นยอดโอนจริง)
-            amounts = [float(m.replace(',', '')) for m in matches if m]
+            amounts = []
+            for m in matches:
+                try:
+                    amt = float(m.replace(',', ''))
+                    # กรองเฉพาะจำนวนที่สมเหตุสมผล (0.01 - 999,999.99)
+                    if 0.01 <= amt <= 999999.99:
+                        amounts.append(amt)
+                except ValueError:
+                    pass
+            # คืนจำนวนที่มากที่สุด (มักเป็นยอดโอนจริง)
             return max(amounts) if amounts else None
+        
         return None
 
     def _extract_bank_name(self, text: str) -> str | None:
-        """ดึงชื่อธนาคาร"""
         for bank, pattern in self.BANK_PATTERNS.items():
             if re.search(pattern, text, re.IGNORECASE):
                 return bank
         return None
 
     def _extract_date(self, text: str) -> str | None:
-        """ดึงวันที่ในรูปแบบ YYYY-MM-DD"""
+        # แปลงเดือนภาษาไทย
+        thai_months = {
+            'ม.ค.': 1, 'ก.พ.': 2, 'มี.ค.': 3, 'เม.ย.': 4, 'พ.ค.': 5, 'มิ.ย.': 6,
+            'ก.ค.': 7, 'ส.ค.': 8, 'ก.ย.': 9, 'ต.ค.': 10, 'พ.ย.': 11, 'ธ.ค.': 12
+        }
+        
+        # ลอง pattern ภาษาไทยก่อน (22 ก.พ. 69)
+        thai_pattern = re.compile(r'(\d{1,2})\s*(ม\.ค\.|ก\.พ\.|มี\.ค\.|เม\.ย\.|พ\.ค\.|มิ\.ย\.|ก\.ค\.|ส\.ค\.|ก\.ย\.|ต\.ค\.|พ\.ย\.|ธ\.ค\.)\s*(\d{2,4})')
+        match = thai_pattern.search(text)
+        if match:
+            day = int(match.group(1))
+            month = thai_months.get(match.group(2))
+            year = int(match.group(3))
+            
+            # แปลง พ.ศ. เป็น ค.ศ.
+            if year < 100:
+                year += 2500  # 69 -> 2569
+            if year > 2500:
+                year -= 543  # 2569 -> 2026
+            
+            try:
+                return f"{year:04d}-{month:02d}-{day:02d}"
+            except (ValueError, TypeError):
+                pass
+        
+        # Fallback: pattern ปกติ (DD/MM/YYYY)
         match = self.DATE_REGEX.search(text)
         if match:
-            day, month, year = match.groups()
-            # แปลง พ.ศ. เป็น ค.ศ.
-            year = int(year)
-            if year > 2500:
-                year -= 543
-            elif year < 100:
-                year += 2000
-            try:
-                return f"{year:04d}-{int(month):02d}-{int(day):02d}"
-            except ValueError:
-                return None
+            groups = match.groups()
+            # ถ้า match แบบไทยแล้ว groups จะเป็น (day, month_abbr, year, None, None)
+            # ถ้า match แบบปกติ groups จะเป็น (None, None, day, month, year)
+            if groups[2] and groups[3]:  # แบบปกติ
+                day, month, year = int(groups[2]), int(groups[3]), int(groups[4])
+                
+                # แปลง พ.ศ. เป็น ค.ศ.
+                if year > 2500:
+                    year -= 543
+                elif year < 100:
+                    year += 2000
+                
+                try:
+                    return f"{year:04d}-{month:02d}-{day:02d}"
+                except ValueError:
+                    pass
+        
         return None
 
     def _extract_time(self, text: str) -> str | None:
-        """ดึงเวลาในรูปแบบ HH:MM:SS"""
         match = self.TIME_REGEX.search(text)
         if match:
             hour, minute, second = match.groups()
@@ -229,41 +272,89 @@ class SlipParser:
         return None
 
     def _extract_ref_no(self, text: str) -> str | None:
-        """ดึงหมายเลขอ้างอิง"""
         match = self.REF_REGEX.search(text)
         return match.group(1) if match else None
 
     def _extract_sender_name(self, text: str) -> str | None:
-        """ดึงชื่อผู้โอน (ต้องปรับตาม format ของแต่ละธนาคาร)"""
-        # ตัวอย่างเบื้องต้น: หาชื่อที่อยู่หลังคำว่า "จาก" หรือ "from"
+        # กรอง noise ออก (คำอธิบายรูป, การ์ตูน, etc.)
+        text_clean = text
+        
+        # ลบ figure tags และเนื้อหาข้างใน
+        text_clean = re.sub(r'<figure>.*?</figure>', '', text_clean, flags=re.DOTALL)
+        
+        # ลบคำที่เป็น noise
+        noise_words = ['one piece', 'ocean of fire', 'ยืนอยู่ทาง', 'ภาพประกอบ', 'qr code', 'เหรียญทอง', 'ตัวละคร']
+        for noise in noise_words:
+            text_clean = re.sub(noise, '', text_clean, flags=re.IGNORECASE)
+        
+        # ตัวอย่างเบื้องต้น: หาชื่อที่อยู่หลังคำว่า "จาก" หรือ "from" หรือชื่อบุคคลไทย
         patterns = [
-            r'(?:จาก|from)[:\s]+([\u0E00-\u0E7Fa-zA-Z\s]+)',
-            r'(?:ผู้โอน|sender)[:\s]+([\u0E00-\u0E7Fa-zA-Z\s]+)',
+            r'(?:จาก|from)[:\s]+((?:นาย|นาง|นางสาว|Mr\.|Mrs\.|Ms\.)\s+[\u0E00-\u0E7Fa-zA-Z\s]+)',
+            r'(?:ผู้โอน|sender)[:\s]+((?:นาย|นาง|นางสาว|Mr\.|Mrs\.|Ms\.)\s+[\u0E00-\u0E7Fa-zA-Z\s]+)',
+            r'^((?:นาย|นาง|นางสาว)\s+[\u0E00-\u0E7F]+(?:\s+[\u0E00-\u0E7F]+){1,2})',
         ]
+        
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+            match = re.search(pattern, text_clean, re.IGNORECASE | re.MULTILINE)
             if match:
-                return match.group(1).strip()
+                name = match.group(1).strip()
+                # ทำความสะอาด: ลบ newlines และช่องว่างซ้ำ
+                name = ' '.join(name.split())
+                # ตรวจสอบว่าชื่อไม่ใช่ noise
+                if len(name) < 100 and not any(n in name.lower() for n in noise_words):
+                    return name
+        
         return None
 
     def _extract_receiver_name(self, text: str) -> str | None:
-        """ดึงชื่อผู้รับ"""
+        # กรอง figure tags
+        text_clean = re.sub(r'<figure>.*?</figure>', '', text, flags=re.DOTALL)
+        
         patterns = [
-            r'(?:ถึง|to|ผู้รับ|receiver)[:\s]+([\u0E00-\u0E7Fa-zA-Z\s]+)',
+            r'(?:ถึง|to|ผู้รับ|receiver)[:\s]+([\u0E00-\u0E7Fa-zA-Z\s&\-\.]+)',
+            r'(?:บริษัท|ห้าง|ร้าน)\s+([\u0E00-\u0E7Fa-zA-Z\s&\-\.]+)',
+            # สำหรับ K+ format: ชื่อร้านอยู่บรรทัดถัดจาก logo/brand
+            r'(?:Tops|7-Eleven|Lotus|Big C|Central|Family Mart|Lawson|Makro)\s*(?:daily)?\n?([\u0E00-\u0E7Fa-zA-Z\s&\-\.]+)',
         ]
+        
         for pattern in patterns:
-            match = re.search(pattern, text, re.IGNORECASE)
+            match = re.search(pattern, text_clean, re.IGNORECASE)
             if match:
-                return match.group(1).strip()
+                name = match.group(1).strip()
+                # ทำความสะอาด: ลบ newlines และช่องว่างซ้ำ
+                name = ' '.join(name.split())
+                # กรองชื่อที่สั้นเกินไป หรือยาวเกินไป
+                if 3 <= len(name) <= 100:
+                    return name
+        
         return None
 
-    def _extract_account(self, text: str) -> str | None:
-        """ดึงเลขบัญชี"""
-        match = self.ACCOUNT_REGEX.search(text)
+    def _extract_sender_account(self, text: str) -> str | None:
+        match = self.BANK_ACCOUNT_REGEX.search(text)
         return match.group(1) if match else None
+
+    def _extract_receiver_account(self, text: str) -> str | None:
+
+        # ลองหา merchant ID ก่อน (ตัวเลขยาวที่ไม่ใช่ ref no.)
+        merchant_match = self.MERCHANT_ID_REGEX.search(text)
+        if merchant_match:
+            merchant_id = merchant_match.group(1)
+            # ตรวจสอบว่าไม่ใช่เลขที่รายการ
+            if merchant_id and len(merchant_id) >= 12:
+                return merchant_id
+        
+        # ถ้าไม่เจอ merchant ID ให้หาบัญชีปกติ (แต่ไม่ใช่ของ sender)
+        # สำหรับกรณีโอนให้บุคคลทั่วไป
+        matches = self.BANK_ACCOUNT_REGEX.findall(text)
+        if len(matches) > 1:
+            # ถ้ามีหลายบัญชี เอาตัวที่ 2 (ตัวแรกมักเป็นของ sender)
+            return matches[1]
+        
+        return None
 
     @staticmethod
     def export_json(data: dict[str, Any], output_path: str, indent: int = 2) -> None:
+
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         
@@ -274,7 +365,6 @@ class SlipParser:
 
     @staticmethod
     def pretty_print(data: dict[str, Any]) -> None:
-        """แสดงข้อมูลในรูปแบบที่อ่านง่าย"""
         print("\n" + "="*60)
         print("📄 SLIP DATA")
         print("="*60)
@@ -292,6 +382,7 @@ class SlipParser:
 
 class SlipOCR:
 
+
     ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".pdf"}
 
     def __init__(
@@ -302,14 +393,7 @@ class SlipOCR:
         auto_parse: bool = False,
         auto_export: bool = False,
     ):
-        """
-        Args:
-            base_url: None = ใช้ cloud API, "http://..." = self-hosted
-            api_key: None = อ่านจาก env, "xxx" = ระบุเอง
-            preprocess: ปรับปรุงภาพก่อน OCR
-            auto_parse: แปลงผลลัพธ์เป็น JSON อัตโนมัติ
-            auto_export: export เป็นไฟล์ JSON อัตโนมัติ (ต้อง auto_parse=True)
-        """
+
         self.preprocess = preprocess
         self.auto_parse = auto_parse
         self.auto_export = auto_export
@@ -321,6 +405,7 @@ class SlipOCR:
         image_path: str,
         output_json: str | None = None
     ) -> str | dict[str, Any]:
+
         path = Path(image_path)
         if not path.exists():
             raise FileNotFoundError(f"ไม่พบไฟล์: {image_path}")
@@ -354,6 +439,9 @@ class SlipOCR:
         return data
 
 
+# ─────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
